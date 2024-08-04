@@ -1,0 +1,128 @@
+#!/usr/bin/env ruby
+
+require 'open3'
+require 'optparse'
+require 'shellwords'
+
+ignore_squash = false
+max_count = 1
+merged_to = []
+print_log = false
+range_options = []
+use_browser = true
+
+parser = OptionParser.new do |opts|
+  opts.banner = 'usage: gh-blame-pr [<options>] [--] <path>'
+
+  opts.on('--ignore-squash', 'Disable heuristics for detecting squash merge') do
+    ignore_squash = true
+  end
+
+  opts.on('-L <range>', 'Blame only the line range (can be specified multiple times; see `git help blame` for details)') do |range|
+    range_options << "-L#{range}"
+  end
+
+  opts.on('-l', '--log', 'Print the log of the merge commit and the commit that actually modified the file') do
+    print_log = true
+  end
+
+  opts.on('-n <number>', '--max-count=<number>', 'Open the <number> most recent pull requests (defaults to 1)') do |number|
+    max_count = number.to_i
+    max_count = Float::INFINITY if max_count <= 0
+  end
+
+  opts.on('-m <branch>', '--merged-to=<branch>', 'The branch name into which the pull request might have merged to (defaults to HEAD; can be specified multiple times)') do |branch|
+    merged_to << branch
+  end
+
+  opts.on('-p', '--print', '--no-browser', 'Print pull request URL instead of opening the browser') do
+    use_browser = false
+  end
+end
+
+parser.parse!
+
+unless system 'command -v git-when-merged &>/dev/null'
+  $stderr.puts 'error: git-when-merged not found in PATH'
+  exit 1
+end
+
+
+if ARGV.empty?
+  $stderr.puts parser.help
+  exit 1
+end
+
+merged_to << 'HEAD' if merged_to.empty?
+
+found_any = false
+
+status = Open3.popen3(*%w(git blame --incremental), *range_options, '--', ARGV[0]) do |stdin, stdout, stderr, thread|
+  stdin.close
+
+  commits = Set.new
+  hash = nil
+  time = nil
+
+  stdout.each_line(chomp: true) do |line|
+
+    case line
+    when /^([0-9a-f]{40}) \d+ \d+ \d+$/
+      hash = $1
+    when /^committer-time (\d+)$/
+      time = $1.to_i
+    when /^filename /
+      commits << { hash:, time: } unless hash.match?(/^0{40}/)
+    end
+  end
+
+  commits.sort_by { |c| -c[:time] }.each.with_index(1) do |commit, i|
+    # In the following code, we use `git rev-list --max-count=1` instead of potentially slower `git show`.
+    # See https://stackoverflow.com/a/17995829/454997
+
+    pr_number = nil
+    merge_commit_hash = nil
+
+    unless ignore_squash
+      hash_and_subject = `git rev-list --max-count=1 --format=%s #{commit[:hash].shellescape}`
+
+      if hash_and_subject =~ /\(#(\d+)\)$/
+        pr_number = $1
+      end
+    end
+
+    unless pr_number
+      merge_commit_hash = `git when-merged --show-commit #{commit[:hash].shellescape} #{merged_to.map(&:shellescape).join(' ')} 2>/dev/null`.chomp
+
+      unless merge_commit_hash.empty?
+        hash_and_subject = `git rev-list --max-count=1 --format=%s #{merge_commit_hash.shellescape}`
+
+        if hash_and_subject =~ /^Merge pull request #(\d+)/
+          pr_number = $1
+        end
+      end
+    end
+
+    if pr_number
+      found_any = true
+
+      system *%w(gh browse), *(use_browser ? [] : ['--no-browser']), pr_number
+
+      if print_log
+        puts
+        puts `git log --max-count=1 #{merge_commit_hash}`, "\n" if merge_commit_hash
+        puts `git log --max-count=1 #{commit[:hash].shellescape}`, "\n"
+      end
+
+      break if i >= max_count
+    end
+  end
+
+  IO.copy_stream(stderr, $stderr)
+
+  thread.value
+end
+
+$stderr.puts 'warning: no pull requests found' unless found_any
+
+exit status.exitstatus
