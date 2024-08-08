@@ -47,7 +47,6 @@ unless system 'command -v git-when-merged &>/dev/null'
   exit 1
 end
 
-
 if ARGV.empty?
   $stderr.puts parser.help
   exit 1
